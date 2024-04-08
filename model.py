@@ -77,9 +77,9 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, in_features = None):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc    = nn.Linear(config.n_embd if in_features is None else in_features, 4 * config.n_embd, bias=config.bias)
         self.gelu    = nn.GELU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
@@ -130,6 +130,9 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
+        # TODO is a special init nessesarley for this layer
+        self.reduce_mlp = MLP(config, in_features=2 * config.n_embd)
+
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
@@ -167,30 +170,56 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    # generates 2 tokens
     def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
 
-        # forward the GPT model itself
+        think_context = self.forward_think(idx)
+
+        for i in range(2):
+            combined_embed = torch.cat((think_context, x), dim=-1)
+            it_embed_combined = self.reduce_mlp(combined_embed)
+            
+            x = self.forward_transcribe(it_embed_combined)
+
+        logits = self.lm_head(x)
+        loss = None
+
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+        return logits, loss
+    
+    def forward_think(self, idx):
+        # forward the GPT model itself#
+        b, t = idx.size()
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        pos_emb = self.get_pos_embeddings(t, idx.device)
+
+        first_transformers = self.transformer.h[:len(self.transformer.h)//2]
+
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
+        for block in first_transformers:
+            x = block(x)
+
+        return x
+
+    def forward_transcribe(self, idx_emb):
+        second_transformers = self.transformer.h[len(self.transformer.h)//2:]
+        b, t, _ = idx_emb.size()
+
+        pos_emb = self.get_pos_embeddings(t, idx_emb.device)
+        x = self.transformer.drop(idx_emb + pos_emb)
+        for block in second_transformers:
             x = block(x)
         x = self.transformer.ln_f(x)
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
+        return x
 
-        return logits, loss
+    def get_pos_embeddings(self, t, device):
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        return self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
