@@ -109,6 +109,7 @@ class Block(nn.Module):
 class GPTConfig:
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_token_predict: int = 1
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -176,17 +177,41 @@ class GPT(nn.Module):
 
         think_context = self.forward_think(idx)
 
-        for i in range(2):
-            combined_embed = torch.cat((think_context, x), dim=-1)
-            it_embed_combined = self.reduce_mlp(combined_embed)
-            
-            x = self.forward_transcribe(it_embed_combined)
+        b, t, _ = x.size()
+        pos_emb = self.get_pos_embeddings(t, x.device)
+        x = self.transformer.drop(x + pos_emb)
 
+        combined_embed = torch.cat((think_context, x), dim=-1)
+        it_embed_combined = self.reduce_mlp(combined_embed)
+        
+        x = self.forward_transcribe(it_embed_combined)
+        x1 = x
+
+        b, t, _ = x.size()
+        pos_emb = self.get_pos_embeddings(t, x.device)
+        x = self.transformer.drop(x + pos_emb)
+
+        combined_embed = torch.cat((think_context, x), dim=-1)
+        it_embed_combined = self.reduce_mlp(combined_embed)
+        
+        x = self.forward_transcribe(it_embed_combined)
+
+        x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
         loss = None
 
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            x1 = self.transformer.ln_f(x1)
+            loss0 = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+            logits1 = self.lm_head(x1)
+            
+            tar = torch.cat((torch.full((64, 1), -1, device=idx.device), targets[:,:-1]), dim=-1)
+            
+            # print("loss",  tar.shape, tar.view(-1).shape)
+
+            loss1 = F.cross_entropy(logits1.view(-1, logits1.size(-1)), tar.view(-1), ignore_index=-1)
+            loss = loss0 + loss1
 
         return logits, loss
     
@@ -204,15 +229,12 @@ class GPT(nn.Module):
 
         return x
 
-    def forward_transcribe(self, idx_emb):
+    def forward_transcribe(self, idx):
         second_transformers = self.transformer.h[len(self.transformer.h)//2:]
-        b, t, _ = idx_emb.size()
 
-        pos_emb = self.get_pos_embeddings(t, idx_emb.device)
-        x = self.transformer.drop(idx_emb + pos_emb)
+        x = idx
         for block in second_transformers:
             x = block(x)
-        x = self.transformer.ln_f(x)
 
         return x
 

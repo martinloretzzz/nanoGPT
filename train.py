@@ -48,6 +48,7 @@ dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
+n_token_predict = 1
 # model
 n_layer = 12
 n_head = 12
@@ -113,16 +114,16 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
-def get_batch(split):
+def get_batch(split, y_offset):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
+    ix = torch.randint(len(data) - block_size - (y_offset - 1), (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+2:i+2+block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+y_offset:i+y_offset+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -145,7 +146,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, n_token_predict=n_token_predict, vocab_size=None, dropout=dropout) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -218,12 +219,27 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
+        acc1, acc2, acc4 = 0, 0, 0
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X, Y = get_batch(split, n_token_predict)
             with ctx:
                 logits, loss = model(X, Y)
+
+            X, Y = get_batch(split, 4)
+            with ctx:      
+                y_pred = model.generate(X, int(4 / n_token_predict))     
+
+                acc1 += torch.eq(y_pred[:, -4:-3], Y[:, -4:-3]).sum().item()
+                acc2 += torch.eq(y_pred[:, -4:-2], Y[:, -4:-2]).sum().item()
+                acc4 += torch.eq(y_pred[:, -4:], Y[:, -4:]).sum().item()
+            
             losses[k] = loss.item()
-        out[split] = losses.mean()
+        loss = losses.mean()
+        acc1 = acc1 / (1 * batch_size * eval_iters)
+        acc2 = acc2 / (2 * batch_size * eval_iters)
+        acc4 = acc4 / (4 * batch_size * eval_iters)
+        wandb_meta = {f"{split}/acc1": acc1, f"{split}/acc2": acc2, f"{split}/acc4": acc4 }
+        out[split] = { "loss": loss, "accuracy": acc1, "wandb_meta": wandb_meta} 
     model.train()
     return out
 
@@ -247,7 +263,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X, Y = get_batch('train', n_token_predict) # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -262,17 +278,19 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"step {iter_num}: train loss {losses['train']['loss']:.4f}, val loss {losses['val']['loss']:.4f}, train acc {losses['train']['accuracy']:.4f}, val acc {losses['val']['accuracy']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
+                **losses['train']['wandb_meta'],
+                **losses['val']['wandb_meta'],
+                "train/loss": losses['train']['loss'],
+                "val/loss": losses['val']['loss'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
+        if always_save_checkpoint: # losses['val']['loss'] < best_val_loss or
+            best_val_loss = losses['val']['loss']
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
@@ -300,7 +318,7 @@ while True:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        X, Y = get_batch('train', n_token_predict)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
