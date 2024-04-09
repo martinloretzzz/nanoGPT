@@ -124,12 +124,13 @@ def get_batch(split, y_offset):
     ix = torch.randint(len(data) - block_size - (y_offset - 1), (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+y_offset:i+y_offset+block_size]).astype(np.int64)) for i in ix])
+    y1 = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+        x, y, y1 = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True), y1.pin_memory().to(device, non_blocking=True)
     else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+        x, y, y1 = x.to(device), y.to(device), y1.to(device)
+    return x, y, y1
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -219,27 +220,35 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
-        acc1, acc2, acc4 = 0, 0, 0
+        acc, acc1, acc2, acc4 = 0, 0, 0, 0
         for k in range(eval_iters):
-            X, Y = get_batch(split, n_token_predict)
+            X, Y, Y1 = get_batch(split, n_token_predict)
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss = model(X, Y, target_1=Y1)
 
-            X, Y = get_batch(split, 4)
+                y_pred = model.generate(X, 1)
+                acc += torch.eq(y_pred[:, -n_token_predict:], Y[:, -n_token_predict:]).sum().item()
+
+            X, Y, Y1 = get_batch(split, 4)
             with ctx:      
-                y_pred = model.generate(X, int(4 / n_token_predict))     
-
+                y_pred = model.generate(X, int(4 / n_token_predict))
+                if iter_num > 500 and False:
+                    print("X")
+                    print(X[0,:])
+                    print(Y[0,:])
+                    print(y_pred[0,:])
                 acc1 += torch.eq(y_pred[:, -4:-3], Y[:, -4:-3]).sum().item()
                 acc2 += torch.eq(y_pred[:, -4:-2], Y[:, -4:-2]).sum().item()
                 acc4 += torch.eq(y_pred[:, -4:], Y[:, -4:]).sum().item()
             
             losses[k] = loss.item()
         loss = losses.mean()
+        acc = acc / (n_token_predict * batch_size * eval_iters)
         acc1 = acc1 / (1 * batch_size * eval_iters)
         acc2 = acc2 / (2 * batch_size * eval_iters)
         acc4 = acc4 / (4 * batch_size * eval_iters)
         wandb_meta = {f"{split}/acc1": acc1, f"{split}/acc2": acc2, f"{split}/acc4": acc4 }
-        out[split] = { "loss": loss, "accuracy": acc1, "wandb_meta": wandb_meta} 
+        out[split] = { "loss": loss, "accuracy": acc, "wandb_meta": wandb_meta} 
     model.train()
     return out
 
@@ -263,7 +272,7 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train', n_token_predict) # fetch the very first batch
+X, Y, Y1 = get_batch('train', n_token_predict) # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -278,7 +287,8 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']['loss']:.4f}, val loss {losses['val']['loss']:.4f}, train acc {losses['train']['accuracy']:.4f}, val acc {losses['val']['accuracy']:.4f}")
+        train_meta = losses['train']['wandb_meta']
+        print(f"step {iter_num}: train loss {losses['train']['loss']:.4f}, val loss {losses['val']['loss']:.4f}, train acc {losses['train']['accuracy']:.4f}, val acc {losses['val']['accuracy']:.4f}, train acc1 {train_meta['train/acc1']:.4f}, train acc2 {train_meta['train/acc2']:.4f}, train acc4 {train_meta['train/acc4']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -315,10 +325,10 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss = model(X, Y, target_1=Y1)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train', n_token_predict)
+        X, Y, Y1 = get_batch('train', n_token_predict)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient

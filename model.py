@@ -172,46 +172,39 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     # generates 2 tokens
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, target_1=None):
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
 
         think_context = self.forward_think(idx)
 
-        b, t, _ = x.size()
-        pos_emb = self.get_pos_embeddings(t, x.device)
-        x = self.transformer.drop(x + pos_emb)
+        x1 = None
+        # print("Predict N", self.config.n_token_predict)
+        for i in range(self.config.n_token_predict):
+            b, t, _ = x.size()
+            pos_emb = self.get_pos_embeddings(t, x.device)
+            x = self.transformer.drop(x + pos_emb)
 
-        combined_embed = torch.cat((think_context, x), dim=-1)
-        it_embed_combined = self.reduce_mlp(combined_embed)
-        
-        x = self.forward_transcribe(it_embed_combined)
-        x1 = x
-
-        b, t, _ = x.size()
-        pos_emb = self.get_pos_embeddings(t, x.device)
-        x = self.transformer.drop(x + pos_emb)
-
-        combined_embed = torch.cat((think_context, x), dim=-1)
-        it_embed_combined = self.reduce_mlp(combined_embed)
-        
-        x = self.forward_transcribe(it_embed_combined)
+            combined_embed = torch.cat((think_context, x), dim=-1)
+            it_embed_combined = self.reduce_mlp(combined_embed)
+            
+            x = self.forward_transcribe(it_embed_combined)
+            if i == 0:
+                x1 = x
 
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
         loss = None
 
         if targets is not None:
-            x1 = self.transformer.ln_f(x1)
             loss0 = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
-            logits1 = self.lm_head(x1)
-            
-            tar = torch.cat((torch.full((64, 1), -1, device=idx.device), targets[:,:-1]), dim=-1)
+            # x1 = self.transformer.ln_f(x1)
+            # logits1 = self.lm_head(x1)
             
             # print("loss",  tar.shape, tar.view(-1).shape)
 
-            loss1 = F.cross_entropy(logits1.view(-1, logits1.size(-1)), tar.view(-1), ignore_index=-1)
-            loss = loss0 + loss1
+            # loss1 = F.cross_entropy(logits1.view(-1, logits1.size(-1)), target_1.view(-1), ignore_index=-1)
+            loss = loss0
 
         return logits, loss
     
@@ -366,16 +359,18 @@ class GPT(nn.Module):
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
+
             # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+            for i in range(self.config.n_token_predict):
+                logits_p = logits[:, -(self.config.n_token_predict - i), :] / temperature
+                #if top_k is not None:
+                #    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                #    logits[logits < v[:, [-(self.config.n_token_predict - i)]]] = -float('Inf')
+                # apply softmax to convert logits to (normalized) probabilities
+                probs = F.softmax(logits_p, dim=-1)
+                # sample from the distribution
+                idx_next = torch.multinomial(probs, num_samples=1)
+                # append sampled index to the running sequence and continue
+                idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
