@@ -28,11 +28,11 @@ class LayerNorm(nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, in_n_embd = None):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = nn.Linear(config.n_embd if in_n_embd is None else in_n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
@@ -51,6 +51,7 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        C = self.n_embd
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
@@ -77,31 +78,42 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
 
-    def __init__(self, config, in_features = None):
+    def __init__(self, config, in_features = None, hidden_features = None, end_gelu = False):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd if in_features is None else in_features, 4 * config.n_embd, bias=config.bias)
+        hidden_dim = 4 * config.n_embd if hidden_features is None else hidden_features
+        self.c_fc    = nn.Linear(config.n_embd if in_features is None else in_features, hidden_dim, bias=config.bias)
         self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj  = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
+        self.gelu2   = nn.GELU() if end_gelu else None
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
+        if self.gelu2 is not None:
+           x = self.gelu2(x) 
         x = self.dropout(x)
         return x
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, in_n_embd=None):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.in_n_embd = in_n_embd
+        self.ln_1 = LayerNorm(config.n_embd if in_n_embd is None else in_n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention(config, in_n_embd=in_n_embd)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+        att = self.attn(self.ln_1(x))
+        # TODO what to do here? Weights aren't added in reduce block
+        if self.in_n_embd is None:
+            x = x + att
+        else:
+            half_x, second_half_x = torch.split(x, int(self.in_n_embd / 2), dim=-1)
+            x = half_x + second_half_x + att
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -111,6 +123,7 @@ class GPTConfig:
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_token_predict: int = 1
     n_layer: int = 12
+    n_think_layer: int = 0
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
@@ -128,11 +141,13 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer - config.n_think_layer)]),
+            h_think = nn.ModuleList([Block(config) for _ in range(config.n_think_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         # TODO is a special init nessesarley for this layer
-        self.reduce_mlp = MLP(config, in_features=2 * config.n_embd)
+        self.reduce_mlp = MLP(config, in_features=2 * config.n_embd , hidden_features = 8 * config.n_embd, end_gelu=True)
+        self.reduce_block = Block(config, in_n_embd=2 * config.n_embd)
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
@@ -173,63 +188,45 @@ class GPT(nn.Module):
 
     # generates 2 tokens
     def forward(self, idx, targets=None, target_1=None):
-        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        b, t = idx.size()
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.get_pos_embeddings(t, idx.device)
 
-        think_context = self.forward_think(idx)
+        x = tok_emb
+
+        think_context = self.transformer.drop(tok_emb + pos_emb)
+
+        for block in self.transformer.h_think:
+            think_context = block(think_context)
 
         x1 = None
         # print("Predict N", self.config.n_token_predict)
         for i in range(self.config.n_token_predict):
-            b, t, _ = x.size()
-            pos_emb = self.get_pos_embeddings(t, x.device)
-            x = self.transformer.drop(x + pos_emb)
+            # b, t, _ = x.size()
+            # pos_emb = 0 # TODO self.get_pos_embeddings(t, x.device)
+            # x = self.transformer.drop(x + pos_emb)
 
             combined_embed = torch.cat((think_context, x), dim=-1)
-            it_embed_combined = self.reduce_mlp(combined_embed)
+            x = self.reduce_block(combined_embed)
             
-            x = self.forward_transcribe(it_embed_combined)
+            for block in self.transformer.h:
+                x = block(x)
+            x = self.transformer.ln_f(x)
             if i == 0:
                 x1 = x
-
-        x = self.transformer.ln_f(x)
+   
         logits = self.lm_head(x)
         loss = None
 
         if targets is not None:
             loss0 = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
-            # x1 = self.transformer.ln_f(x1)
+            # TODO what doesn't work with injecting the loss here?
             # logits1 = self.lm_head(x1)
-            
-            # print("loss",  tar.shape, tar.view(-1).shape)
-
             # loss1 = F.cross_entropy(logits1.view(-1, logits1.size(-1)), target_1.view(-1), ignore_index=-1)
             loss = loss0
 
         return logits, loss
-    
-    def forward_think(self, idx):
-        # forward the GPT model itself#
-        b, t = idx.size()
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.get_pos_embeddings(t, idx.device)
-
-        first_transformers = self.transformer.h[:len(self.transformer.h)//2]
-
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in first_transformers:
-            x = block(x)
-
-        return x
-
-    def forward_transcribe(self, idx):
-        second_transformers = self.transformer.h[len(self.transformer.h)//2:]
-
-        x = idx
-        for block in second_transformers:
-            x = block(x)
-
-        return x
 
     def get_pos_embeddings(self, t, device):
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
