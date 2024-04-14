@@ -192,18 +192,17 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.get_pos_embeddings(t, idx.device)
 
-        x = tok_emb
+        x = self.transformer.drop(tok_emb + pos_emb)
 
-        think_context = self.transformer.drop(tok_emb + pos_emb)
+        think_context = x
 
         for block in self.transformer.h_think:
             think_context = block(think_context)
 
         x1 = None
-        # print("Predict N", self.config.n_token_predict)
         for i in range(self.config.n_token_predict):
             # b, t, _ = x.size()
-            # pos_emb = 0 # TODO self.get_pos_embeddings(t, x.device)
+            # pos_emb = self.get_pos_embeddings(t, x.device)
             # x = self.transformer.drop(x + pos_emb)
 
             combined_embed = torch.cat((think_context, x), dim=-1)
@@ -213,8 +212,8 @@ class GPT(nn.Module):
                 x = block(x)
             x = self.transformer.ln_f(x)
             if i == 0:
-                x1 = x
-   
+                x1 = x.clone()
+
         logits = self.lm_head(x)
         loss = None
 
@@ -224,6 +223,7 @@ class GPT(nn.Module):
             # TODO what doesn't work with injecting the loss here?
             # logits1 = self.lm_head(x1)
             # loss1 = F.cross_entropy(logits1.view(-1, logits1.size(-1)), target_1.view(-1), ignore_index=-1)
+
             loss = loss0
 
         return logits, loss
